@@ -430,11 +430,11 @@ C4(1/2) E4(1/2) G4(1/2) +1/2 [ C4(1/2)* F4(1/2)* A5(1/2)* +1/2 ] C4(1) E4(1) G4(
 """.strip()
 
 
-def format_beats(beats: float):
-    return f"{beats:.3f}".rstrip("0").rstrip(".")
-
-
 class ScorePromptEncoderV2(ScorePromptEncoder):
+    @staticmethod
+    def format_beats(beats: float):
+        return f"{beats:.3f}".rstrip("0").rstrip(".")
+
     def encode(
         self,
         notes: list[Note],
@@ -467,17 +467,21 @@ class ScorePromptEncoderV2(ScorePromptEncoder):
 
         for note in sorted_notes:
             if timeline_selection_start_dummy_note is note:
-                encoded_list.append(f"{format_beats(ticks_to_beats(note.time))}-[")
+                encoded_list.append(
+                    f"{ScorePromptEncoderV2.format_beats(ticks_to_beats(note.time))}-["
+                )
                 continue
 
             if timeline_selection_end_dummy_note is note:
-                encoded_list.append(f"{format_beats(ticks_to_beats(note.time))}-]")
+                encoded_list.append(
+                    f"{ScorePromptEncoderV2.format_beats(ticks_to_beats(note.time))}-]"
+                )
                 continue
 
             # Add the note representation
             note_str = note_number_to_str(note.number)
             encoded_list.append(
-                f"{format_beats(ticks_to_beats(note.time))}-{note_str}-{format_beats(ticks_to_beats(note.length))}{'*' if note.selected else ''}"
+                f"{ScorePromptEncoderV2.format_beats(ticks_to_beats(note.time))}-{note_str}-{ScorePromptEncoderV2.format_beats(ticks_to_beats(note.length))}{'*' if note.selected else ''}"
             )
 
         return encoded_list
@@ -531,11 +535,11 @@ class ScorePromptEncoderV2(ScorePromptEncoder):
         return """
 - Each note is represented by a string in the format "<time>-<note>-<length>", where <time> is the start time of the note in beats (floating point, up to 0.001 precision), <note> is a string representing the note name and octave (e.g. "C4", "A#5"), and <length> is a string representing the length of the note in beats (floating point, up to 0.001 precision).
 - All note times are absolute, including your output notes.
-- A selected note has a * at the end of the string (e.g. "1.000-C4-0.500*").
+- A selected note has a * at the end of the string (e.g. "1-C4-0.5*").
 - Timeline selection region is represented by "<time>-[" and "<time>-]", where <time> is the start/end time of the timeline selection in beats (floating point, up to 0.001 precision).
 - If filling notes in the timeline selection, try to write from the start to the end of the selection instead of terminating abruptly in the middle.
 Example:
-0.000-C4-0.500 0.000-E4-0.500 0.000-G4-0.500 1.000-[ 1.000-C4-0.500* 1.000-F4-0.500* 1.000-A5-0.500* 2.000-] 2.000-C4-1.000 2.000-E4-1.000 2.000-G4-1.000
+0-C4-0.5 0-E4-0.5 0-G4-0.5 1-[ 1-C4-0.5* 1-F4-0.5* 1-A5-0.5* 2-] 2-C4-1 2-E4-1 2-G4-1
 """.strip()
 
 
@@ -545,6 +549,10 @@ def write_note(note):
 
 GPT_MODELS = [
     "gpt-4-0125-preview",
+    "gpt-4-1106-preview",
+    "gpt-4-turbo-preview",
+    "gpt-4-0613",
+    "gpt-4",
     "gpt-3.5-turbo-0125",
 ]
 
@@ -588,16 +596,16 @@ def query_llm(api_key, prompt, model):
 MAX_PROMPT_LENGTH = 7500
 MAX_PROMPT_LENGTH_WITHOUT_NOTES = MAX_PROMPT_LENGTH - 500
 INSTRUCTION_PROMPT_TIMELINE_REPLACE_SELECTION = """
-Your task is to write new notes within the timeline selection region that will replace the selected notes. You should be mindful of the existing selected notes and try to modify/improve it. Your output note will start exactly at the start of the timeline selection region.
+Your task is to write new notes within the timeline selection region that will replace the selected notes. You should be mindful of the existing selected notes and try to modify/improve it. Your output should be placed inside the time range, and try to write for the whole time range.
 """.strip()
 INSTRUCTION_PROMPT_TIMELINE = """
-Your task is to write new notes that will be added to the timeline selection region. Your output note will start exactly at the start of the timeline selection region.
+Your task is to write new notes that will be added within the timeline selection region. Your output note will start exactly at the start of the timeline selection region, and try to write for the whole time range.
 """.strip()
 INSTRUCTION_PROMPT_REPLACE_SELECTION = """
-Your task is to write notes that will replace the selected notes. You should be mindful of the existing selected notes and try to modify/improve it. Your output note will start exactly at the start of the first selected note.
+Your task is to write notes that will replace the selected notes. You should be mindful of the existing selected notes and try to modify/improve it.
 """.strip()
 INSTRUCTION_PROMPT_OVERLAY_SELECTION = """
-Your task is to write notes that overlays selected notes (adds to the same region). You should be mindful of the existing selected notes and try to create things like accompanying harmonics or counter melodies. Your output note will start exactly at the start of the first selected note.
+Your task is to write notes that will overlay selected notes (adds to the same region). You should be mindful of the existing selected notes and try to create things like accompanying harmonics or counter melodies.
 """.strip()
 INSTRUCTION_PROMPT_CONTINUE_AT_END = """
 Your task is to continue the score at the end. Your output note will start exactly at the end of the last note.
@@ -623,7 +631,6 @@ Your output should begin with "BEGIN_NOTES" followed by a single line containing
 BEGIN_NOTES
 (your generated notes here in copilot format)
 ```
-Your output should not contain timeline selection region or any selected notes.
 """.strip()
 
 

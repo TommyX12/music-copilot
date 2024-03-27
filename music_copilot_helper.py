@@ -11,7 +11,7 @@ try:
     response = client.chat.completions.create(
         model=message_json["model"],
         messages=[{"role": "user", "content": message_json["prompt"]}],
-        temperature=1,
+        temperature=0.25,
     )
     print("SUCCESS")
     print(response.choices[0].message.content)
