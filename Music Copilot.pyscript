@@ -1,0 +1,756 @@
+"""
+API-reference for flpianoroll
+-------------
+def Note
+  number    # note number (midi standard)
+  time      # ticks
+  length    # ticks
+  group     # group number this note belongs to
+  pan       # 0.0 - 1.0, default 0.5
+  velocity  # 0.0 - 1.0, default 0.8
+  release   # 0.0 - 1.0
+  color     # 0 - 15, default 0. Color group / MIDI channel.
+  fcut      # 0.0 - 1.0, default 0.5
+  fres      # 0.0 - 1.0, default 0.5
+  pitchofs  # -120 to 120
+  slide     # True/False
+  porta     # True/False
+  muted     # True/False
+  selected  # True/False
+  
+  clone()   # create a copy of this note (not yet added to the score)
+
+def Marker
+  time      # ticks
+  name
+  mode      # integer
+  tsnum     # when marker is a time signature
+  tsden     # when marker is a time signature
+
+def Score
+  PPQ              # ticks per quarter note (read-only)
+  tsnum            # current project time signature numerator (read-only)
+  tsden            # current project time signature denominator (read-only)
+  clear([all])     # remove notes and markers. Specify "True" to clear all, instead of just selected.
+  clearNotes([all])       # remove notes. Specify "True" to clear all, instead of just selected.
+  clearMarkers([all])     # remove markers. Specify "True" to clear all, instead of just selected.
+  getTimelineSelection()  # returns a tuple with start and end time of the current timeline selection.
+  getDefaultNoteProperties() # returns a Note with the default note properties
+
+  noteCount         # nr of notes (read-only)
+  addNote(note)     # add new note
+  getNote(index)    # get note
+  deleteNote(index) # delete note
+
+  markerCount          # nr of markers (read-only)
+  addMarker(marker)    # add new marker
+  getMarker(index)     # get marker
+  deleteMarker(index)  # delete marker
+  
+def ScriptDialog
+  restoreFormValues    # set to True to store form values between runs (default is True)
+  
+  def ScriptDialog(Title, Description)        # Initializes a new script dialog
+  def SetText(Description)                    # Change the description that is shown
+  def AddInput(aName,Value)                   # Adds a generic input control
+  def AddInputKnob(aName, Value, Min, Max)    # Adds a knob input control with floating point value
+  def AddInputKnobInt(aName, Value, Min, Max) # Adds a knob input control with integer value
+  def AddInputCombo(aName, ValueList, Value)  # Adds a combobox input control
+  def AddInputText(aName, Value)              # Adds a text input control
+  def AddInputCheckbox(aName, Value)          # Adds a checkbox input control with boolean value
+  def GetInputValue(aName)                    # Retrieve the current value of the input with the specified name
+  def Execute                                 # Show the dialog. Returns TRUE if the user pressed OK, FALSE if the dialog was cancelled
+"""
+
+from typing import Any
+import flpianoroll as flp
+from dataclasses import dataclass
+import re
+import random
+import os
+import subprocess
+import json
+import time
+from abc import ABC, abstractmethod
+
+
+def print(*values):
+    string = " ".join(map(str, values))
+    for line in string.splitlines():
+        flp.Utils.log(line)
+
+
+def ticks_to_beats_str(ticks):
+    def gcd(a, b):
+        while b:
+            a, b = b, a % b
+        return a
+
+    def reduce_fraction(n, d):
+        g = gcd(n, d)
+        return n // g, d // g
+
+    # Convert to a fraction
+    # Beat = ticks / PPQ / 4 * tsden = ticks * tsden / (PPQ * 4)
+    # numerator = ticks * flp.score.tsden
+    # denominator = flp.score.PPQ * 4
+    # TODO: Note that tsden is not reliable. Therefore we should not use it. Just treat beats as always quarter notes.
+    numerator = ticks
+    denominator = flp.score.PPQ
+    numerator, denominator = reduce_fraction(numerator, denominator)
+
+    # Convert to string
+    if denominator == 1:
+        return str(numerator)
+    else:
+        return f"{numerator}/{denominator}"
+
+
+def beats_str_to_ticks(beats_str):
+    if "/" in beats_str:
+        numerator, denominator = map(int, beats_str.split("/"))
+        # return numerator * flp.score.PPQ * 4 // (denominator * flp.score.tsden)
+        return numerator * flp.score.PPQ // denominator
+    else:
+        # return int(beats_str) * flp.score.PPQ * 4 // flp.score.tsden
+        return int(beats_str) * flp.score.PPQ
+
+
+def ticks_to_beats(ticks):
+    return ticks / flp.score.PPQ
+
+
+def beats_to_ticks(beats):
+    # return beats * flp.score.PPQ * 4 // flp.score.tsden
+    return int(beats * flp.score.PPQ)
+
+
+NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+NOTE_INDEX_MAPPING = {note_name: index for index, note_name in enumerate(NOTE_NAMES)}
+
+
+def note_number_to_str(note_number):
+    octave = note_number // 12
+    note_index = note_number % 12
+    note_name = NOTE_NAMES[note_index]
+    return f"{note_name}{octave}"
+
+
+def str_to_note_number(note_str):
+    note_name = note_str[:-1]
+    octave = int(note_str[-1])
+    note_index = NOTE_INDEX_MAPPING[note_name]
+    return octave * 12 + note_index
+
+
+@dataclass
+class Note:
+    time: int  # In terms of ticks
+    length: int  # In terms of ticks
+    number: int
+    selected: bool = False
+
+    @staticmethod
+    def from_flp_note(note: flp.Note):
+        return Note(
+            time=note.time,
+            length=note.length,
+            number=note.number,
+            selected=note.selected,
+        )
+
+    def to_flp_note(self):
+        note = flp.Note()
+        note.time = self.time
+        note.length = self.length
+        note.number = self.number
+        note.selected = self.selected
+        return note
+
+    def __str__(self):
+        return f"Note(time={ticks_to_beats_str(self.time)}, length={ticks_to_beats_str(self.length)}, number={note_number_to_str(self.number)}, selected={self.selected})"
+
+    def __repr__(self):
+        return str(self)
+
+
+class ScorePromptEncoder(ABC):
+    @abstractmethod
+    def encode(
+        self,
+        notes: list[Note],
+        timeline_selection_start_ticks: int | None,
+        timeline_selection_end_ticks: int | None,
+    ) -> list[str]:
+        pass
+
+    @abstractmethod
+    def decode(
+        self,
+        encoded_strings: list[str],
+        start_time_ticks: int,
+        end_time_ticks: int | None,
+    ):
+        pass
+
+    @abstractmethod
+    def is_timeline_selection_start(self, encoded_token: str) -> bool:
+        pass
+
+    @abstractmethod
+    def is_timeline_selection_end(self, encoded_token: str) -> bool:
+        pass
+
+    @abstractmethod
+    def is_selected_note(self, encoded_token: str) -> bool:
+        pass
+
+    @abstractmethod
+    def get_system_prompt(self) -> str:
+        pass
+
+    def stringify_encoded_strings(
+        self, encoded_strings: list[str], max_characters: int
+    ) -> str:
+        left_bracket_index = None
+        right_bracket_index = None
+        first_selected_note_index = None
+        last_selected_note_index = None
+
+        # Step 1: Identify key indices
+        for i, token in enumerate(encoded_strings):
+            if self.is_timeline_selection_start(token):
+                if left_bracket_index is not None:
+                    raise ValueError("Multiple timeline selection start found")
+                left_bracket_index = i
+            elif self.is_timeline_selection_end(token):
+                if right_bracket_index is not None:
+                    raise ValueError("Multiple timeline selection end found")
+                if left_bracket_index is None:
+                    raise ValueError("Timeline selection end found before start")
+                right_bracket_index = i
+            elif self.is_selected_note(token):
+                if first_selected_note_index is None:
+                    first_selected_note_index = i
+                last_selected_note_index = i
+
+        if (left_bracket_index is None) != (right_bracket_index is None):
+            raise ValueError("Only one of timeline selection start/end found")
+
+        # Determine the must-include range
+        if left_bracket_index is not None:
+            must_include_start = left_bracket_index
+            must_include_end = right_bracket_index
+        elif first_selected_note_index is not None:
+            must_include_start = first_selected_note_index
+            must_include_end = last_selected_note_index
+        else:
+            must_include_start = must_include_end = None
+
+        # Initialize pointers for expansion
+        start_index = (
+            must_include_start
+            if must_include_start is not None
+            else len(encoded_strings)
+        )
+        end_index = (
+            must_include_end
+            if must_include_end is not None
+            else len(encoded_strings) - 1
+        )
+
+        # Calculate length of the must-include section
+        current_length = sum(
+            len(encoded_strings[i]) for i in range(start_index, end_index + 1)
+        )
+        current_length += max(0, end_index - start_index) * 1  # Account for spaces
+
+        if current_length > max_characters:
+            if left_bracket_index is not None:
+                raise ValueError("Timeline selection contains too many notes")
+
+            if first_selected_note_index is not None:
+                raise ValueError("Too many notes selected")
+
+            raise ValueError("This should not happen")
+
+        # Expand to include as many tokens as possible
+        while start_index > 0 or end_index < len(encoded_strings) - 1:
+            added = False
+            # Try adding left
+            if start_index > 0:
+                potential_add_left = (
+                    len(encoded_strings[start_index - 1]) + 1
+                )  # Include space
+                if current_length + potential_add_left <= max_characters:
+                    current_length += potential_add_left
+                    start_index -= 1
+                    added = True
+
+            # Try adding right
+            if end_index < len(encoded_strings) - 1:
+                potential_add_right = (
+                    len(encoded_strings[end_index + 1]) + 1
+                )  # Include space
+                if current_length + potential_add_right <= max_characters:
+                    current_length += potential_add_right
+                    end_index += 1
+                    added = True
+
+            if not added:
+                break
+
+        assert current_length <= max_characters
+
+        return " ".join(encoded_strings[start_index : end_index + 1])
+
+
+class ScorePromptEncoderV1(ScorePromptEncoder):
+    def encode(
+        self,
+        notes: list[Note],
+        timeline_selection_start_ticks: int | None,
+        timeline_selection_end_ticks: int | None,
+    ):
+        assert (timeline_selection_start_ticks is None) == (
+            timeline_selection_end_ticks is None
+        )
+        notes = notes[:]
+        timeline_selection_start_dummy_note = (
+            Note(timeline_selection_start_ticks, 0, -1)
+            if timeline_selection_start_ticks is not None
+            else None
+        )
+        timeline_selection_end_dummy_note = (
+            Note(timeline_selection_end_ticks, 0, -1)
+            if timeline_selection_end_ticks is not None
+            else None
+        )
+        if timeline_selection_start_dummy_note is not None:
+            notes.append(timeline_selection_start_dummy_note)
+
+        if timeline_selection_end_dummy_note is not None:
+            notes.append(timeline_selection_end_dummy_note)
+
+        sorted_notes = sorted(notes, key=lambda note: (note.time, note.number))
+
+        encoded_list = []
+        last_time = 0  # Keep track of the end time of the last note
+
+        for note in sorted_notes:
+            # Calculate time difference (if any) from the last note
+            if note.time > last_time:
+                delta_time = note.time - last_time
+                delta_beats_str = ticks_to_beats_str(delta_time)
+                encoded_list.append(f"+{delta_beats_str}")
+
+            # Update last_time to the end of the current note
+            last_time = note.time
+
+            if timeline_selection_start_dummy_note is note:
+                encoded_list.append("[")
+                continue
+
+            if timeline_selection_end_dummy_note is note:
+                encoded_list.append("]")
+                continue
+
+            # Add the note representation
+            note_str = note_number_to_str(note.number)
+            length_beats_str = ticks_to_beats_str(note.length)
+            encoded_list.append(
+                f"{note_str}({length_beats_str}){'*' if note.selected else ''}"
+            )
+
+        return encoded_list
+
+    def decode(
+        self,
+        encoded_strings: list[str],
+        start_time_ticks: int,
+        end_time_ticks: int | None,
+    ):
+        # Define regex patterns for matching notes and time increases
+        note_pattern = re.compile(r"([A-G][#b]?[0-9])\(([\d/]+)\)\*?")
+        time_increase_pattern = re.compile(r"\+([\d/]+)")
+
+        notes = []
+        current_time = start_time_ticks
+
+        for part in encoded_strings:
+            # Check for time pointer increase
+            time_match = time_increase_pattern.match(part)
+            if time_match:
+                delta_beats_str = time_match.group(1)
+                delta_ticks = beats_str_to_ticks(delta_beats_str)
+                current_time += delta_ticks
+                continue
+
+            # Check for note representation
+            note_match = note_pattern.match(part)
+            if note_match:
+                note_str = note_match.group(1)
+                length_beats_str = note_match.group(2)
+
+                midi_number = str_to_note_number(note_str)
+                length_ticks = beats_str_to_ticks(length_beats_str)
+
+                note = Note(current_time, length_ticks, midi_number)
+                if end_time_ticks is not None:
+                    # Trim or skip notes that exceed the end time
+                    if note.time >= end_time_ticks:
+                        break
+
+                    if note.time + note.length > end_time_ticks:
+                        note.length = end_time_ticks - note.time
+
+                notes.append(note)
+
+        return sorted(notes, key=lambda note: note.time)
+
+    def is_timeline_selection_start(self, encoded_token: str) -> bool:
+        return encoded_token == "["
+
+    def is_timeline_selection_end(self, encoded_token: str) -> bool:
+        return encoded_token == "]"
+
+    def is_selected_note(self, encoded_token: str) -> bool:
+        return encoded_token.endswith("*")
+
+    def get_system_prompt(self) -> str:
+        return """
+- Each note is represented by a string in the format "NoteName(Length)", where NoteName is a string representing the note name and octave (e.g. "C4", "A#5") and Length is a string representing the length of the note in beats (e.g. "1/4", "1/8", "1/16").
+- Unless specified, all notes occur at the same time in the score (e.g. "C4(1/4) E4(1/4) G4(1/4)" is a C major chord hitting at the same time). To increase the time pointer, each time increase is represented by a string in the format "+Length", where Length is a string representing the length of the time increase in beats (e.g. "+1/4", "+1/8", "+1/16").
+- A selected note has a * at the end of the string (e.g. "C4(1/4)*").
+- "[" and "]" are used to represent timeline selection region.
+- If filling notes in the timeline selection, try to write from the start to the end of the selection instead of terminating abruptly in the middle.
+- If there's timeline selection or selected note, your output will be placed relative to the start of them, so no need to add time increase.
+Example:
+C4(1/2) E4(1/2) G4(1/2) +1/2 [ C4(1/2)* F4(1/2)* A5(1/2)* +1/2 ] C4(1) E4(1) G4(1) +1
+""".strip()
+
+
+def format_beats(beats: float):
+    return f"{beats:.3f}".rstrip("0").rstrip(".")
+
+
+class ScorePromptEncoderV2(ScorePromptEncoder):
+    def encode(
+        self,
+        notes: list[Note],
+        timeline_selection_start_ticks: int | None,
+        timeline_selection_end_ticks: int | None,
+    ):
+        assert (timeline_selection_start_ticks is None) == (
+            timeline_selection_end_ticks is None
+        )
+        notes = notes[:]
+        timeline_selection_start_dummy_note = (
+            Note(timeline_selection_start_ticks, 0, -1)
+            if timeline_selection_start_ticks is not None
+            else None
+        )
+        timeline_selection_end_dummy_note = (
+            Note(timeline_selection_end_ticks, 0, -1)
+            if timeline_selection_end_ticks is not None
+            else None
+        )
+        if timeline_selection_start_dummy_note is not None:
+            notes.append(timeline_selection_start_dummy_note)
+
+        if timeline_selection_end_dummy_note is not None:
+            notes.append(timeline_selection_end_dummy_note)
+
+        sorted_notes = sorted(notes, key=lambda note: (note.time, note.number))
+
+        encoded_list = []
+
+        for note in sorted_notes:
+            if timeline_selection_start_dummy_note is note:
+                encoded_list.append(f"{format_beats(ticks_to_beats(note.time))}-[")
+                continue
+
+            if timeline_selection_end_dummy_note is note:
+                encoded_list.append(f"{format_beats(ticks_to_beats(note.time))}-]")
+                continue
+
+            # Add the note representation
+            note_str = note_number_to_str(note.number)
+            encoded_list.append(
+                f"{format_beats(ticks_to_beats(note.time))}-{note_str}-{format_beats(ticks_to_beats(note.length))}{'*' if note.selected else ''}"
+            )
+
+        return encoded_list
+
+    def decode(
+        self,
+        encoded_strings: list[str],
+        start_time_ticks: int,
+        end_time_ticks: int | None,
+    ):
+        # Define regex patterns for matching notes and time increases
+        note_pattern = re.compile(r"([\d.]+)-([A-G][#b]?[0-9])-([\d.]+)\*?")
+
+        notes = []
+
+        for part in encoded_strings:
+            # Check for note representation
+            note_match = note_pattern.match(part)
+            if note_match:
+                time_beats = float(note_match.group(1))
+                note_str = note_match.group(2)
+                length_beats = float(note_match.group(3))
+
+                midi_number = str_to_note_number(note_str)
+                time_ticks = beats_to_ticks(time_beats)
+                length_ticks = beats_to_ticks(length_beats)
+
+                note = Note(time_ticks, length_ticks, midi_number)
+                if end_time_ticks is not None:
+                    # Trim or skip notes that exceed the end time
+                    if note.time >= end_time_ticks:
+                        break
+
+                    if note.time + note.length > end_time_ticks:
+                        note.length = end_time_ticks - note.time
+
+                notes.append(note)
+
+        return sorted(notes, key=lambda note: note.time)
+
+    def is_timeline_selection_start(self, encoded_token: str) -> bool:
+        return encoded_token.endswith("-[")
+
+    def is_timeline_selection_end(self, encoded_token: str) -> bool:
+        return encoded_token.endswith("-]")
+
+    def is_selected_note(self, encoded_token: str) -> bool:
+        return encoded_token.endswith("*")
+
+    def get_system_prompt(self) -> str:
+        return """
+- Each note is represented by a string in the format "<time>-<note>-<length>", where <time> is the start time of the note in beats (floating point, up to 0.001 precision), <note> is a string representing the note name and octave (e.g. "C4", "A#5"), and <length> is a string representing the length of the note in beats (floating point, up to 0.001 precision).
+- All note times are absolute, including your output notes.
+- A selected note has a * at the end of the string (e.g. "1.000-C4-0.500*").
+- Timeline selection region is represented by "<time>-[" and "<time>-]", where <time> is the start/end time of the timeline selection in beats (floating point, up to 0.001 precision).
+- If filling notes in the timeline selection, try to write from the start to the end of the selection instead of terminating abruptly in the middle.
+Example:
+0.000-C4-0.500 0.000-E4-0.500 0.000-G4-0.500 1.000-[ 1.000-C4-0.500* 1.000-F4-0.500* 1.000-A5-0.500* 2.000-] 2.000-C4-1.000 2.000-E4-1.000 2.000-G4-1.000
+""".strip()
+
+
+def write_note(note):
+    flp.score.addNote(note.to_flp_note())
+
+
+GPT_MODELS = [
+    "gpt-4-0125-preview",
+    "gpt-3.5-turbo-0125",
+]
+
+
+INITIAL_DUMMY_PROMPT = "DISABLE PREVIEW THEN REMOVE THIS LINE"
+
+
+with open("openai_api_key.txt", "r") as file:
+    OPENAI_API_KEY = file.read().strip()
+
+
+def get_description():
+    return """WARNING: PREVIEW MUST BE DISABLED. This script uses language model to generate notes based on the (optional) provided prompt. If any notes are selected and "Replace Selected" is checked, the generated notes will replace the selected notes; otherwise, the generated notes will be added to the score. If timeline selection exist, the notes will be placed inside the timeline selection; otherwise, the notes will be added either in place of the replaced notes or at the end. "GPT Model" parameter specifies the language model to use."""
+
+
+def query_llm(api_key, prompt, model):
+    data = {
+        "prompt": prompt,
+        "api_key": api_key,
+        "model": model,
+    }
+    json_string = json.dumps(data)
+    command = ["python", "music_copilot_helper.py", json_string]
+    process: Any = subprocess.Popen(
+        command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+    )
+    i = 0
+    while process.poll() is None:
+        flp.Utils.ProgressMsg("Generating...", i, 10)
+        time.sleep(0.25)
+        i = (i + 1) % 10
+
+    output_data = process.stdout.read()
+    response = output_data.decode("utf-8-sig").strip().splitlines()
+    if response[0] != "SUCCESS":
+        raise Exception("\n".join(response[1:]))
+
+    return "\n".join(response[1:])
+
+
+MAX_PROMPT_LENGTH = 7500
+MAX_PROMPT_LENGTH_WITHOUT_NOTES = MAX_PROMPT_LENGTH - 500
+INSTRUCTION_PROMPT_TIMELINE_REPLACE_SELECTION = """
+Your task is to write new notes within the timeline selection region that will replace the selected notes. You should be mindful of the existing selected notes and try to modify/improve it. Your output note will start exactly at the start of the timeline selection region.
+""".strip()
+INSTRUCTION_PROMPT_TIMELINE = """
+Your task is to write new notes that will be added to the timeline selection region. Your output note will start exactly at the start of the timeline selection region.
+""".strip()
+INSTRUCTION_PROMPT_REPLACE_SELECTION = """
+Your task is to write notes that will replace the selected notes. You should be mindful of the existing selected notes and try to modify/improve it. Your output note will start exactly at the start of the first selected note.
+""".strip()
+INSTRUCTION_PROMPT_OVERLAY_SELECTION = """
+Your task is to write notes that overlays selected notes (adds to the same region). You should be mindful of the existing selected notes and try to create things like accompanying harmonics or counter melodies. Your output note will start exactly at the start of the first selected note.
+""".strip()
+INSTRUCTION_PROMPT_CONTINUE_AT_END = """
+Your task is to continue the score at the end. Your output note will start exactly at the end of the last note.
+""".strip()
+USER_PROMPT_TEMPLATE = """
+User's additional prompt:
+{text}
+""".strip()
+PROMPT_TEMPLATE = """
+You are a creative master of music.
+You work with a score format called "copilot" that represents notes in a musical score:
+{encoder_system_prompt}
+
+Here are the existing notes in the score:
+{{notes}}
+
+{instruction_prompts}
+!!You MUST also account the structure, style, rhythm, melody, pattern, and harmony of the existing score, while also innovating and making the music sound good.!!
+{user_prompt}
+
+Your output should begin with "BEGIN_NOTES" followed by a single line containing the generated notes in copilot format, such as:
+```
+BEGIN_NOTES
+(your generated notes here in copilot format)
+```
+Your output should not contain timeline selection region or any selected notes.
+""".strip()
+
+
+# score_prompt_encoder = ScorePromptEncoderV1()
+score_prompt_encoder = ScorePromptEncoderV2()
+
+
+def build_prompt(
+    user_prompt_text: str,
+    sorted_notes: list[Note],
+    timeline_selection_start: int | None,
+    timeline_selection_end: int | None,
+    has_selected_notes: bool,
+    replace_selected: bool,
+):
+    if timeline_selection_start is not None and timeline_selection_end is not None:
+        instruction_prompts = (
+            INSTRUCTION_PROMPT_TIMELINE_REPLACE_SELECTION
+            if replace_selected and has_selected_notes
+            else INSTRUCTION_PROMPT_TIMELINE
+        )
+    else:
+        instruction_prompts = (
+            (
+                INSTRUCTION_PROMPT_REPLACE_SELECTION
+                if replace_selected
+                else INSTRUCTION_PROMPT_OVERLAY_SELECTION
+            )
+            if has_selected_notes
+            else INSTRUCTION_PROMPT_CONTINUE_AT_END
+        )
+
+    user_prompt = (
+        USER_PROMPT_TEMPLATE.format(text=user_prompt_text) if user_prompt_text else ""
+    )
+    template = PROMPT_TEMPLATE.format(
+        instruction_prompts=instruction_prompts,
+        user_prompt=user_prompt,
+        encoder_system_prompt=score_prompt_encoder.get_system_prompt(),
+    )
+    if len(template) > MAX_PROMPT_LENGTH_WITHOUT_NOTES:
+        raise Exception(f"Prompt length is too long. Please reduce user prompt length.")
+
+    notes_str = score_prompt_encoder.stringify_encoded_strings(
+        score_prompt_encoder.encode(
+            sorted_notes, timeline_selection_start, timeline_selection_end
+        ),
+        MAX_PROMPT_LENGTH - len(template),
+    )
+    return template.format(notes=notes_str)
+
+
+sorted_notes = sorted(
+    [Note.from_flp_note(flp.score.getNote(i)) for i in range(flp.score.noteCount)],
+    key=lambda note: (note.time, note.number),
+)
+if len(sorted_notes) > 0 and sorted_notes[0].selected:
+    raise NotImplementedError(
+        "Note selection is unsupported since Piano Roll Scripts are not allowed to access other notes if some notes are selected. Please unselect notes."
+    )
+
+
+def createDialog():
+    dialog = flp.ScriptDialog("Copilot", get_description())
+    dialog.AddInputText("Prompt", INITIAL_DUMMY_PROMPT)
+    dialog.AddInputCombo("GPT Model", ",".join(GPT_MODELS), 0)
+    # dialog.AddInputCheckbox("Replace Selected", True)
+    return dialog
+
+
+def apply(form):
+    user_prompt_text = form.GetInputValue("Prompt")
+    if user_prompt_text == INITIAL_DUMMY_PROMPT:
+        return
+
+    model_to_use = GPT_MODELS[form.GetInputValue("GPT Model")]
+    # replace_selected = form.GetInputValue("Replace Selected")
+    replace_selected = False
+    timeline_selection = flp.score.getTimelineSelection()
+    has_timeline_selection = timeline_selection[0] >= 0 and timeline_selection[1] >= 0
+    first_selected_note = next((note for note in sorted_notes if note.selected), None)
+    last_selected_note = next(
+        (note for note in reversed(sorted_notes) if note.selected), None
+    )
+    if has_timeline_selection:
+        start_time_ticks, end_time_ticks = timeline_selection
+    else:
+        if len(sorted_notes) == 0:
+            start_time_ticks = 0
+            end_time_ticks = None
+        else:
+            if first_selected_note is not None and last_selected_note is not None:
+                start_time_ticks = first_selected_note.time
+                end_time_ticks = last_selected_note.time + last_selected_note.length
+            else:
+                start_time_ticks = sorted_notes[-1].time + sorted_notes[-1].length
+                end_time_ticks = None
+
+    model_prompt = build_prompt(
+        user_prompt_text,
+        sorted_notes,
+        start_time_ticks if has_timeline_selection else None,
+        end_time_ticks if has_timeline_selection else None,
+        first_selected_note is not None,
+        replace_selected,
+    )
+    print("===== Prompt =====")
+    print(model_prompt)
+    model_response = query_llm(OPENAI_API_KEY, model_prompt, model_to_use)
+    print("===== Response =====")
+    print(model_response)
+    lines = model_response.splitlines()
+
+    notes_str = None
+    for i in range(len(lines) - 1):
+        if lines[i].strip() == "BEGIN_NOTES":
+            notes_str = lines[i + 1].strip()
+            break
+
+    if notes_str is None:
+        raise Exception("No notes found in the model response. Please try again.")
+
+    generated_notes = score_prompt_encoder.decode(
+        notes_str.split(), start_time_ticks, end_time_ticks
+    )
+    if replace_selected and first_selected_note is not None:
+        flp.score.clearNotes()
+
+    for note in generated_notes:
+        write_note(note)
