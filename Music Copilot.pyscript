@@ -143,6 +143,11 @@ def str_to_note_number(note_str):
     return octave * 12 + note_index
 
 
+@staticmethod
+def format_beats(beats: float):
+    return f"{beats:.3f}".rstrip("0").rstrip(".")
+
+
 @dataclass
 class Note:
     time: int  # In terms of ticks
@@ -431,10 +436,6 @@ C4(1/2) E4(1/2) G4(1/2) +1/2 [ C4(1/2)* F4(1/2)* A5(1/2)* +1/2 ] C4(1) E4(1) G4(
 
 
 class ScorePromptEncoderV2(ScorePromptEncoder):
-    @staticmethod
-    def format_beats(beats: float):
-        return f"{beats:.3f}".rstrip("0").rstrip(".")
-
     def encode(
         self,
         notes: list[Note],
@@ -467,21 +468,17 @@ class ScorePromptEncoderV2(ScorePromptEncoder):
 
         for note in sorted_notes:
             if timeline_selection_start_dummy_note is note:
-                encoded_list.append(
-                    f"{ScorePromptEncoderV2.format_beats(ticks_to_beats(note.time))}-["
-                )
+                encoded_list.append(f"{format_beats(ticks_to_beats(note.time))}-[")
                 continue
 
             if timeline_selection_end_dummy_note is note:
-                encoded_list.append(
-                    f"{ScorePromptEncoderV2.format_beats(ticks_to_beats(note.time))}-]"
-                )
+                encoded_list.append(f"{format_beats(ticks_to_beats(note.time))}-]")
                 continue
 
             # Add the note representation
             note_str = note_number_to_str(note.number)
             encoded_list.append(
-                f"{ScorePromptEncoderV2.format_beats(ticks_to_beats(note.time))}-{note_str}-{ScorePromptEncoderV2.format_beats(ticks_to_beats(note.length))}{'*' if note.selected else ''}"
+                f"{format_beats(ticks_to_beats(note.time))}-{note_str}-{format_beats(ticks_to_beats(note.length))}{'*' if note.selected else ''}"
             )
 
         return encoded_list
@@ -495,7 +492,7 @@ class ScorePromptEncoderV2(ScorePromptEncoder):
         # Define regex patterns for matching notes and time increases
         note_pattern = re.compile(r"([\d.]+)-([A-G][#b]?[0-9])-([\d.]+)\*?")
 
-        notes = []
+        notes: list[Note] = []
 
         for part in encoded_strings:
             # Check for note representation
@@ -564,15 +561,12 @@ with open("openai_api_key.txt", "r") as file:
     OPENAI_API_KEY = file.read().strip()
 
 
-def get_description():
-    return """WARNING: PREVIEW MUST BE DISABLED. This script uses language model to generate notes based on the (optional) provided prompt. If any notes are selected and "Replace Selected" is checked, the generated notes will replace the selected notes; otherwise, the generated notes will be added to the score. If timeline selection exist, the notes will be placed inside the timeline selection; otherwise, the notes will be added either in place of the replaced notes or at the end. "GPT Model" parameter specifies the language model to use."""
-
-
-def query_llm(api_key, prompt, model):
+def query_llm(api_key, prompt, model, mode):
     data = {
         "prompt": prompt,
         "api_key": api_key,
         "model": model,
+        "mode": mode,
     }
     json_string = json.dumps(data)
     command = ["python", "music_copilot_helper.py", json_string]
@@ -595,26 +589,49 @@ def query_llm(api_key, prompt, model):
 
 MAX_PROMPT_LENGTH = 7500
 MAX_PROMPT_LENGTH_WITHOUT_NOTES = MAX_PROMPT_LENGTH - 500
-INSTRUCTION_PROMPT_TIMELINE_REPLACE_SELECTION = """
+
+
+class ScoreCopilot(ABC):
+    @abstractmethod
+    def get_description(self) -> str:
+        pass
+
+    @abstractmethod
+    def run(
+        self,
+        model_to_use: str,
+        user_prompt_text: str,
+        sorted_notes: list[Note],
+        start_time_ticks: int,
+        end_time_ticks: int | None,
+        has_timeline_selection: bool,
+        has_selected_notes: bool,
+        replace_selected: bool,
+    ) -> list[Note]:
+        pass
+
+
+class ScoreCopilotChat(ScoreCopilot):
+    INSTRUCTION_PROMPT_TIMELINE_REPLACE_SELECTION = """
 Your task is to write new notes within the timeline selection region that will replace the selected notes. You should be mindful of the existing selected notes and try to modify/improve it. Your output should be placed inside the time range, and try to write for the whole time range.
 """.strip()
-INSTRUCTION_PROMPT_TIMELINE = """
+    INSTRUCTION_PROMPT_TIMELINE = """
 Your task is to write new notes that will be added within the timeline selection region. Your output note will start exactly at the start of the timeline selection region, and try to write for the whole time range.
 """.strip()
-INSTRUCTION_PROMPT_REPLACE_SELECTION = """
+    INSTRUCTION_PROMPT_REPLACE_SELECTION = """
 Your task is to write notes that will replace the selected notes. You should be mindful of the existing selected notes and try to modify/improve it.
 """.strip()
-INSTRUCTION_PROMPT_OVERLAY_SELECTION = """
+    INSTRUCTION_PROMPT_OVERLAY_SELECTION = """
 Your task is to write notes that will overlay selected notes (adds to the same region). You should be mindful of the existing selected notes and try to create things like accompanying harmonics or counter melodies.
 """.strip()
-INSTRUCTION_PROMPT_CONTINUE_AT_END = """
+    INSTRUCTION_PROMPT_CONTINUE_AT_END = """
 Your task is to continue the score at the end. Your output note will start exactly at the end of the last note.
 """.strip()
-USER_PROMPT_TEMPLATE = """
+    USER_PROMPT_TEMPLATE = """
 User's additional prompt:
 {text}
 """.strip()
-PROMPT_TEMPLATE = """
+    PROMPT_TEMPLATE = """
 You are a creative master of music.
 You work with a score format called "copilot" that represents notes in a musical score:
 {encoder_system_prompt}
@@ -633,54 +650,215 @@ BEGIN_NOTES
 ```
 """.strip()
 
+    def __init__(self, score_prompt_encoder: ScorePromptEncoder):
+        self.score_prompt_encoder = score_prompt_encoder
+
+    def get_description(self):
+        return """WARNING: PREVIEW MUST BE DISABLED. This script uses language model to generate notes based on the (optional) provided prompt. If any notes are selected and "Replace Selected" is checked, the generated notes will replace the selected notes; otherwise, the generated notes will be added to the score. If timeline selection exist, the notes will be placed inside the timeline selection; otherwise, the notes will be added either in place of the replaced notes or at the end. "GPT Model" parameter specifies the language model to use."""
+
+    @classmethod
+    def build_prompt(
+        cls,
+        user_prompt_text: str,
+        sorted_notes: list[Note],
+        timeline_selection_start: int | None,
+        timeline_selection_end: int | None,
+        has_selected_notes: bool,
+        replace_selected: bool,
+    ):
+        if timeline_selection_start is not None and timeline_selection_end is not None:
+            instruction_prompts = (
+                cls.INSTRUCTION_PROMPT_TIMELINE_REPLACE_SELECTION
+                if replace_selected and has_selected_notes
+                else cls.INSTRUCTION_PROMPT_TIMELINE
+            )
+        else:
+            instruction_prompts = (
+                (
+                    cls.INSTRUCTION_PROMPT_REPLACE_SELECTION
+                    if replace_selected
+                    else cls.INSTRUCTION_PROMPT_OVERLAY_SELECTION
+                )
+                if has_selected_notes
+                else cls.INSTRUCTION_PROMPT_CONTINUE_AT_END
+            )
+
+        user_prompt = (
+            cls.USER_PROMPT_TEMPLATE.format(text=user_prompt_text)
+            if user_prompt_text
+            else ""
+        )
+        template = cls.PROMPT_TEMPLATE.format(
+            instruction_prompts=instruction_prompts,
+            user_prompt=user_prompt,
+            encoder_system_prompt=score_prompt_encoder.get_system_prompt(),
+        )
+        if len(template) > MAX_PROMPT_LENGTH_WITHOUT_NOTES:
+            raise Exception(
+                f"Prompt length is too long. Please reduce user prompt length."
+            )
+
+        notes_str = score_prompt_encoder.stringify_encoded_strings(
+            score_prompt_encoder.encode(
+                sorted_notes, timeline_selection_start, timeline_selection_end
+            ),
+            MAX_PROMPT_LENGTH - len(template),
+        )
+        return template.format(notes=notes_str)
+
+    def run(
+        self,
+        model_to_use: str,
+        user_prompt_text: str,
+        sorted_notes: list[Note],
+        start_time_ticks: int,
+        end_time_ticks: int | None,
+        has_timeline_selection: bool,
+        has_selected_notes: bool,
+        replace_selected: bool,
+    ):
+        model_prompt = ScoreCopilotChat.build_prompt(
+            user_prompt_text,
+            sorted_notes,
+            start_time_ticks if has_timeline_selection else None,
+            end_time_ticks if has_timeline_selection else None,
+            has_selected_notes,
+            replace_selected,
+        )
+        print("===== Prompt =====")
+        print(model_prompt)
+        model_response = query_llm(OPENAI_API_KEY, model_prompt, model_to_use, "chat")
+        print("===== Response =====")
+        print(model_response)
+        lines = model_response.splitlines()
+
+        notes_str = None
+        for i in range(len(lines) - 1):
+            if lines[i].strip() == "BEGIN_NOTES":
+                notes_str = lines[i + 1].strip()
+                break
+
+        if notes_str is None:
+            raise Exception("No notes found in the model response. Please try again.")
+
+        generated_notes = score_prompt_encoder.decode(
+            notes_str.split(), start_time_ticks, end_time_ticks
+        )
+
+        return generated_notes
+
+
+class ScoreCopilotCompletion(ScoreCopilot):
+    USER_PROMPT_TEMPLATE = """
+Additional description for the score is as follows (for the part after the marker):
+{text}
+""".strip()
+    PROMPT_TEMPLATE = """You are a creative master of music.
+You work with a score format called "copilot" that represents notes in a musical score:
+{encoder_system_prompt}
+Additionally, a `|` indicates a marker position in the score.
+Each piece should begin with "BEGIN_NOTES" followed by a single line containing the notes in copilot format, such as:
+```
+BEGIN_NOTES
+(notes in copilot format)
+```
+
+You have now written a score in the copilot format. There should be {total_beats} beats of music after the marker.
+{user_prompt}
+```
+BEGIN_NOTES
+{{notes}} | """  # do not strip
+    DEFAULT_TOTAL_BEATS = 8
+
+    def __init__(self, score_prompt_encoder: ScorePromptEncoder):
+        self.score_prompt_encoder = score_prompt_encoder
+
+    def get_description(self):
+        return """WARNING: PREVIEW MUST BE DISABLED. This script uses language model to generate new notes based on the (optional) provided prompt. If timeline selection is present, the generated notes will be placed within the timeline selection."""
+
+    @classmethod
+    def build_prompt(
+        cls,
+        user_prompt_text: str,
+        sorted_notes: list[Note],
+        timeline_selection_start: int | None,
+        timeline_selection_end: int | None,
+    ):
+        if timeline_selection_start is not None and timeline_selection_end is not None:
+            total_beats = max(
+                0, ticks_to_beats(timeline_selection_end - timeline_selection_start)
+            )
+
+        else:
+            total_beats = cls.DEFAULT_TOTAL_BEATS
+
+        user_prompt = (
+            cls.USER_PROMPT_TEMPLATE.format(text=user_prompt_text)
+            if user_prompt_text
+            else ""
+        )
+        template = cls.PROMPT_TEMPLATE.format(
+            user_prompt=user_prompt,
+            encoder_system_prompt=score_prompt_encoder.get_system_prompt(),
+            total_beats=format_beats(total_beats),
+        )
+        if len(template) > MAX_PROMPT_LENGTH_WITHOUT_NOTES:
+            raise Exception(
+                f"Prompt length is too long. Please reduce user prompt length."
+            )
+
+        if timeline_selection_start is not None:
+            # Create a copy of sorted notes that is clamped to timeline_selection_start.
+            sorted_notes = [
+                # Remove selection status
+                dataclass.replace(note, selected=False)
+                for note in sorted_notes
+                if timeline_selection_start is None
+                or note.time < timeline_selection_start
+            ]
+
+        notes_str = score_prompt_encoder.stringify_encoded_strings(
+            score_prompt_encoder.encode(sorted_notes, None, None),
+            MAX_PROMPT_LENGTH - len(template),
+        )
+        return template.format(notes=notes_str)
+
+    def run(
+        self,
+        model_to_use: str,
+        user_prompt_text: str,
+        sorted_notes: list[Note],
+        start_time_ticks: int,
+        end_time_ticks: int | None,
+        has_timeline_selection: bool,
+        has_selected_notes: bool,
+        replace_selected: bool,
+    ):
+        assert not has_selected_notes, "Note selection is unsupported"
+
+        model_prompt = ScoreCopilotCompletion.build_prompt(
+            user_prompt_text,
+            sorted_notes,
+            start_time_ticks if has_timeline_selection else None,
+            end_time_ticks if has_timeline_selection else None,
+        )
+        print("===== Prompt =====")
+        print(model_prompt)
+        model_response = query_llm(OPENAI_API_KEY, model_prompt, model_to_use, "completion")
+        print("===== Response =====")
+        print(model_response)
+        notes_str = model_response.splitlines()[0]
+        generated_notes = score_prompt_encoder.decode(
+            notes_str.split(), start_time_ticks, end_time_ticks
+        )
+        return generated_notes
+
 
 # score_prompt_encoder = ScorePromptEncoderV1()
 score_prompt_encoder = ScorePromptEncoderV2()
 
-
-def build_prompt(
-    user_prompt_text: str,
-    sorted_notes: list[Note],
-    timeline_selection_start: int | None,
-    timeline_selection_end: int | None,
-    has_selected_notes: bool,
-    replace_selected: bool,
-):
-    if timeline_selection_start is not None and timeline_selection_end is not None:
-        instruction_prompts = (
-            INSTRUCTION_PROMPT_TIMELINE_REPLACE_SELECTION
-            if replace_selected and has_selected_notes
-            else INSTRUCTION_PROMPT_TIMELINE
-        )
-    else:
-        instruction_prompts = (
-            (
-                INSTRUCTION_PROMPT_REPLACE_SELECTION
-                if replace_selected
-                else INSTRUCTION_PROMPT_OVERLAY_SELECTION
-            )
-            if has_selected_notes
-            else INSTRUCTION_PROMPT_CONTINUE_AT_END
-        )
-
-    user_prompt = (
-        USER_PROMPT_TEMPLATE.format(text=user_prompt_text) if user_prompt_text else ""
-    )
-    template = PROMPT_TEMPLATE.format(
-        instruction_prompts=instruction_prompts,
-        user_prompt=user_prompt,
-        encoder_system_prompt=score_prompt_encoder.get_system_prompt(),
-    )
-    if len(template) > MAX_PROMPT_LENGTH_WITHOUT_NOTES:
-        raise Exception(f"Prompt length is too long. Please reduce user prompt length.")
-
-    notes_str = score_prompt_encoder.stringify_encoded_strings(
-        score_prompt_encoder.encode(
-            sorted_notes, timeline_selection_start, timeline_selection_end
-        ),
-        MAX_PROMPT_LENGTH - len(template),
-    )
-    return template.format(notes=notes_str)
+# score_copilot = ScoreCopilotChat(score_prompt_encoder)
+score_copilot = ScoreCopilotCompletion(score_prompt_encoder)
 
 
 sorted_notes = sorted(
@@ -688,13 +866,12 @@ sorted_notes = sorted(
     key=lambda note: (note.time, note.number),
 )
 if len(sorted_notes) > 0 and sorted_notes[0].selected:
-    raise NotImplementedError(
-        "Note selection is unsupported since Piano Roll Scripts are not allowed to access other notes if some notes are selected. Please unselect notes."
-    )
+    # Currently, Piano Roll Scripts are not allowed to access other notes if some notes are selected.
+    raise NotImplementedError("Note selection is unsupported. Please unselect notes.")
 
 
 def createDialog():
-    dialog = flp.ScriptDialog("Copilot", get_description())
+    dialog = flp.ScriptDialog("Copilot", score_copilot.get_description())
     dialog.AddInputText("Prompt", INITIAL_DUMMY_PROMPT)
     dialog.AddInputCombo("GPT Model", ",".join(GPT_MODELS), 0)
     # dialog.AddInputCheckbox("Replace Selected", True)
@@ -729,33 +906,17 @@ def apply(form):
                 start_time_ticks = sorted_notes[-1].time + sorted_notes[-1].length
                 end_time_ticks = None
 
-    model_prompt = build_prompt(
+    generated_notes = score_copilot.run(
+        model_to_use,
         user_prompt_text,
         sorted_notes,
-        start_time_ticks if has_timeline_selection else None,
-        end_time_ticks if has_timeline_selection else None,
+        start_time_ticks,
+        end_time_ticks,
+        has_timeline_selection,
         first_selected_note is not None,
         replace_selected,
     )
-    print("===== Prompt =====")
-    print(model_prompt)
-    model_response = query_llm(OPENAI_API_KEY, model_prompt, model_to_use)
-    print("===== Response =====")
-    print(model_response)
-    lines = model_response.splitlines()
 
-    notes_str = None
-    for i in range(len(lines) - 1):
-        if lines[i].strip() == "BEGIN_NOTES":
-            notes_str = lines[i + 1].strip()
-            break
-
-    if notes_str is None:
-        raise Exception("No notes found in the model response. Please try again.")
-
-    generated_notes = score_prompt_encoder.decode(
-        notes_str.split(), start_time_ticks, end_time_ticks
-    )
     if replace_selected and first_selected_note is not None:
         flp.score.clearNotes()
 
