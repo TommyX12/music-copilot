@@ -62,6 +62,7 @@ def ScriptDialog
   def Execute                                 # Show the dialog. Returns TRUE if the user pressed OK, FALSE if the dialog was cancelled
 """
 
+import dataclasses
 from typing import Any
 import flpianoroll as flp
 from dataclasses import dataclass
@@ -126,7 +127,10 @@ def beats_to_ticks(beats):
 
 
 NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+NOTE_ALIASES = {"Db": "C#", "Eb": "D#", "Gb": "F#", "Ab": "G#", "Bb": "A#"}
+
 NOTE_INDEX_MAPPING = {note_name: index for index, note_name in enumerate(NOTE_NAMES)}
+NOTE_INDEX_MAPPING.update({alias: NOTE_INDEX_MAPPING[note_name] for alias, note_name in NOTE_ALIASES.items()})
 
 
 def note_number_to_str(note_number):
@@ -137,8 +141,18 @@ def note_number_to_str(note_number):
 
 
 def str_to_note_number(note_str):
-    note_name = note_str[:-1]
-    octave = int(note_str[-1])
+    note_str = note_str.capitalize()
+    
+    if len(note_str) > 2 and note_str[1] in {'b', '#'}:
+        note_name = note_str[:2]
+        octave = int(note_str[2:])
+    else:
+        note_name = note_str[0]
+        octave = int(note_str[1:])
+    
+    if note_name in NOTE_ALIASES:
+        note_name = NOTE_ALIASES[note_name]
+    
     note_index = NOTE_INDEX_MAPPING[note_name]
     return octave * 12 + note_index
 
@@ -561,12 +575,11 @@ with open("openai_api_key.txt", "r") as file:
     OPENAI_API_KEY = file.read().strip()
 
 
-def query_llm(api_key, prompt, model, mode):
+def query_llm(api_key, prompt, model):
     data = {
         "prompt": prompt,
         "api_key": api_key,
         "model": model,
-        "mode": mode,
     }
     json_string = json.dumps(data)
     command = ["python", "music_copilot_helper.py", json_string]
@@ -727,7 +740,7 @@ BEGIN_NOTES
         )
         print("===== Prompt =====")
         print(model_prompt)
-        model_response = query_llm(OPENAI_API_KEY, model_prompt, model_to_use, "chat")
+        model_response = query_llm(OPENAI_API_KEY, model_prompt, model_to_use)
         print("===== Response =====")
         print(model_response)
         lines = model_response.splitlines()
@@ -750,24 +763,24 @@ BEGIN_NOTES
 
 class ScoreCopilotCompletion(ScoreCopilot):
     USER_PROMPT_TEMPLATE = """
-Additional description for the score is as follows (for the part after the marker):
+Additional description for the continuation:
 {text}
 """.strip()
     PROMPT_TEMPLATE = """You are a creative master of music.
 You work with a score format called "copilot" that represents notes in a musical score:
 {encoder_system_prompt}
-Additionally, a `|` indicates a marker position in the score.
 Each piece should begin with "BEGIN_NOTES" followed by a single line containing the notes in copilot format, such as:
 ```
 BEGIN_NOTES
 (notes in copilot format)
 ```
 
-You have now written a score in the copilot format. There should be {total_beats} beats of music after the marker.
+You have now written a score in the copilot format:
+{{notes}}
+
+Continue (for {total_beats} beats) in copilot format.
 {user_prompt}
-```
-BEGIN_NOTES
-{{notes}} | """  # do not strip
+""".strip()
     DEFAULT_TOTAL_BEATS = 8
 
     def __init__(self, score_prompt_encoder: ScorePromptEncoder):
@@ -807,15 +820,14 @@ BEGIN_NOTES
                 f"Prompt length is too long. Please reduce user prompt length."
             )
 
-        if timeline_selection_start is not None:
-            # Create a copy of sorted notes that is clamped to timeline_selection_start.
-            sorted_notes = [
-                # Remove selection status
-                dataclass.replace(note, selected=False)
-                for note in sorted_notes
-                if timeline_selection_start is None
-                or note.time < timeline_selection_start
-            ]
+        # Create a copy of sorted notes that is clamped to timeline_selection_start.
+        sorted_notes = [
+            # Remove selection status
+            dataclasses.replace(note, selected=False)
+            for note in sorted_notes
+            if timeline_selection_start is None
+            or note.time < timeline_selection_start
+        ]
 
         notes_str = score_prompt_encoder.stringify_encoded_strings(
             score_prompt_encoder.encode(sorted_notes, None, None),
@@ -844,13 +856,23 @@ BEGIN_NOTES
         )
         print("===== Prompt =====")
         print(model_prompt)
-        model_response = query_llm(OPENAI_API_KEY, model_prompt, model_to_use, "completion")
+        model_response = query_llm(OPENAI_API_KEY, model_prompt, model_to_use)
         print("===== Response =====")
         print(model_response)
-        notes_str = model_response.splitlines()[0]
+        lines = model_response.splitlines()
+        notes_str = None
+        for i in range(len(lines) - 1):
+            if lines[i].strip() == "BEGIN_NOTES":
+                notes_str = lines[i + 1].strip()
+                break
+
+        if notes_str is None:
+            raise Exception("No notes found in the model response. Please try again.")
+
         generated_notes = score_prompt_encoder.decode(
             notes_str.split(), start_time_ticks, end_time_ticks
         )
+
         return generated_notes
 
 
