@@ -44,3 +44,8 @@ Some of the things it does not do well include:
 - Making arpeggios from existing notes
 - Generating counter melodies or completions that sound good
 - Generating good music from scratch
+
+## Future Work
+
+- GPT is very general and powerful, but it's not trained specifically for music. A custom model trained to model music data would be able to generate melodically and harmonically better music, similar to [MuseNet](https://openai.com/research/musenet).
+- FL Studio piano roll scripts are limited in what they can do. In the ideal world, DAWs should embrace AI workflow and allow models to access data across channels, tracks, patterns, and so on, to be able to generate with respect to the entire song.
