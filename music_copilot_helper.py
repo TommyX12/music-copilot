@@ -1,4 +1,4 @@
-TEMPERATURE = 0.25
+TEMPERATURE = 1
 
 try:
     from openai import OpenAI
@@ -16,6 +16,7 @@ try:
         temperature=TEMPERATURE,
     )
     print("SUCCESS")
+    assert response.choices[0].message.content is not None
     print(response.choices[0].message.content)
 
 except Exception as e:
